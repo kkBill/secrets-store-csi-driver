@@ -111,6 +111,8 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	cfg.UserAgent = version.GetUserAgent("controller")
 
+	// manager是用于创建Controller的
+	// 具体是什么作用？？以及各个字段的含义是什么？？
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:             scheme,
 		MetricsBindAddress: *metricsAddr,
@@ -151,6 +153,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 创建secret provider class pod status对象的reconciler
 	reconciler, err := controllers.New(mgr, *nodeID)
 	if err != nil {
 		klog.ErrorS(err, "failed to create secret provider class pod status reconciler")
@@ -196,6 +199,7 @@ func main() {
 		go rec.Run(ctx.Done())
 	}
 
+	// 创建CSI Driver并启动
 	driver := secretsstore.NewSecretsStoreDriver(*driverName, *nodeID, *endpoint, *providerVolumePath, providerClients, mgr.GetClient(), mgr.GetAPIReader())
 	driver.Run(ctx)
 }

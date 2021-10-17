@@ -222,6 +222,7 @@ func (r *SecretProviderClassPodStatusReconciler) Reconcile(ctx context.Context, 
 
 	klog.InfoS("reconcile started", "spcps", req.NamespacedName.String())
 
+	// 获取spcPodStatus对象，spcPodStatus包含了Pod与绑定的secret版本等信息
 	spcPodStatus := &v1alpha1.SecretProviderClassPodStatus{}
 	if err := r.reader.Get(ctx, req.NamespacedName, spcPodStatus); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -260,12 +261,15 @@ func (r *SecretProviderClassPodStatusReconciler) Reconcile(ctx context.Context, 
 		return ctrl.Result{}, err
 	}
 
+	// 在使用过程中，spc.Spec.SecretObjects这个字段不定义也没关系啊
+	// 这里怎么直接返回了？？
 	if len(spc.Spec.SecretObjects) == 0 {
 		klog.InfoS("no secret objects defined for spc, nothing to reconcile", "spc", klog.KObj(spc), "spcps", klog.KObj(spcPodStatus))
 		return ctrl.Result{}, nil
 	}
 
 	// determine which pod volume this is associated with
+	// 找到Pod中挂载的secrets-store.csi.k8s.io类型的卷
 	podVol := k8sutil.SPCVolume(pod, spc.Name)
 	if podVol == nil {
 		return ctrl.Result{}, fmt.Errorf("failed to find secret provider class pod status volume for pod %s/%s", req.Namespace, spcPodStatus.Status.PodName)

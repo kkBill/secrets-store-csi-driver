@@ -149,6 +149,8 @@ func (r *Reconciler) Run(stopCh <-chan struct{}) {
 		case <-ticker.C:
 			// The spc pod status informer is configured to do a filtered list watch of spc pod statuses
 			// labeled for the same node as the driver. LIST will only return the filtered results.
+			// 每隔rotationPollInterval时间，就对SecretProviderClassPodStatus进行一个List操作
+			// 然后将SecretProviderClassPodStatus对象重新加入队列，进行处理
 			spcPodStatusList := &v1alpha1.SecretProviderClassPodStatusList{}
 			err := r.cache.List(context.Background(), spcPodStatusList)
 			if err != nil {
@@ -247,6 +249,7 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 	}()
 
 	// get pod from manager's cache
+	// 获取与secret关联的应用Pod
 	pod := &v1.Pod{}
 	err = r.cache.Get(
 		ctx,
@@ -285,6 +288,20 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 	}
 
 	// determine which pod volume this is associated with
+	// 确定应用Pod里挂载的、有secret-csi-driver指定的Volume的信息（一个pod内可能关联多种不同csi-driver提供的存储卷， 通过SPCVolume()过滤出secret-csi-driver提供的存储卷）
+	// 即取出如下信息
+	/*
+	# example-pod.yaml
+	...
+	volumes:
+	  - name: secrets-store-inline
+	    csi:
+	      driver: secrets-store.csi.k8s.io
+	      readOnly: true
+	      volumeAttributes:
+	        secretProviderClass: "my-provider"
+	...
+	*/
 	podVol := k8sutil.SPCVolume(pod, spc.Name)
 	if podVol == nil {
 		errorReason = internalerrors.PodVolumeNotFound
@@ -303,9 +320,10 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 
 	parameters := make(map[string]string)
 	if spc.Spec.Parameters != nil {
-		parameters = spc.Spec.Parameters
+		parameters = spc.Spec.Parameters // 这里才是存放的secret列表
 	}
 	// Set these parameters to mimic the exact same attributes we get as part of NodePublishVolumeRequest
+	// NodePublishVolumeRequest 的作用是啥？
 	parameters[csipodname] = pod.Name
 	parameters[csipodnamespace] = pod.Namespace
 	parameters[csipoduid] = string(pod.UID)
@@ -322,6 +340,10 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 
 	// check if the volume pertaining to the current spc is using nodePublishSecretRef for
 	// accessing external secrets store
+	// 检查当前使用的Volume是否使用nodePublishSecretRef来访问外部的secret存储
+	// 在当前看到的示例中，并没有指定 podVol.CSI.NodePublishSecretRef，也就是说，csi-driver向provider发起的mount请求中
+	// secret的信息是存储在 spc.Spec.Parameters 中的
+	// 在 provider 的实现中，目前也没有使用到这部分内容
 	nodePublishSecretRef := podVol.CSI.NodePublishSecretRef
 
 	var secretsJSON []byte
@@ -369,6 +391,10 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 		r.generateEvent(pod, v1.EventTypeWarning, mountRotationFailedReason, fmt.Sprintf("failed to lookup provider client: %q", providerName))
 		return fmt.Errorf("failed to lookup provider client: %q", providerName)
 	}
+	// MountContent 调用client Mount()，并解析返回结果
+	// 返回结果是最新的secrets的版本信息
+	// 注意，当前的实现方案(aws-provider)中，并没有使用nodePublishSecretRef，即secretsJSON其实是空的
+	// 用户想要挂载的secret信息是通过paramsJSON参数传进去的!!!
 	newObjectVersions, errorReason, err := secretsstore.MountContent(ctx, providerClient, string(paramsJSON), string(secretsJSON), spcps.Status.TargetPath, string(permissionJSON), oldObjectVersions)
 	if err != nil {
 		r.generateEvent(pod, v1.EventTypeWarning, mountRotationFailedReason, fmt.Sprintf("provider mount err: %+v", err))
@@ -377,6 +403,7 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 
 	// compare the old object versions and new object versions to check if any of the objects
 	// have been updated by the provider
+	// 对比secret的版本是否一致，如果不一致，说明需要更新
 	for k, v := range newObjectVersions {
 		version, ok := oldObjectVersions[strings.TrimSpace(k)]
 		if ok && strings.TrimSpace(version) == strings.TrimSpace(v) {
@@ -397,6 +424,7 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 	// the diff in versions is populated in the secret provider class pod status and if the
 	// secret provider class contains secret objects, then the corresponding kubernetes secrets
 	// data is updated with the latest versions
+	// 更新 SecretProviderClassPodStatus 对象（即，把spcps.Status.Objects换成最新的version）
 	if requiresUpdate {
 		// generate an event for successful mount update
 		r.generateEvent(pod, v1.EventTypeNormal, mountRotationCompleteReason, fmt.Sprintf("successfully rotated mounted contents for spc %s/%s", spc.Namespace, spc.Name))
@@ -437,6 +465,8 @@ func (r *Reconciler) reconcile(ctx context.Context, spcps *v1alpha1.SecretProvid
 		r.generateEvent(pod, v1.EventTypeWarning, k8sSecretRotationFailedReason, fmt.Sprintf("failed to get mounted files, err: %+v", err))
 		return fmt.Errorf("failed to get mounted files, err: %+v", err)
 	}
+	// 如果spc.Spec.SecretObjects不为空的话，就把从secret store中获取的secret内容同步的k8s的secret对象里
+	// 注意，从secret store中获取的secret内容 和 k8s的secret对象 不是完全等价的概念
 	for _, secretObj := range spc.Spec.SecretObjects {
 		secretName := strings.TrimSpace(secretObj.SecretName)
 
